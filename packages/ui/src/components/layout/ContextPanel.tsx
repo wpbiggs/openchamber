@@ -1,21 +1,35 @@
 import React from 'react';
-import { RiArrowLeftRightLine, RiChat4Line, RiCloseLine, RiDonutChartFill, RiFileTextLine, RiFullscreenExitLine, RiFullscreenLine, RiGlobalLine, RiRefreshLine, RiExternalLinkLine, RiPlayLine } from '@remixicon/react';
+import { RiArrowLeftRightLine, RiChat4Line, RiCloseLine, RiDonutChartFill, RiFileCopyLine, RiFileTextLine, RiFullscreenExitLine, RiFullscreenLine, RiGlobalLine, RiRefreshLine, RiExternalLinkLine, RiPlayLine } from '@remixicon/react';
 
 import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { SortableTabsStrip } from '@/components/ui/sortable-tabs-strip';
 import { DiffView, FilesView, PlanView } from '@/components/views';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { openExternalUrl } from '@/lib/url';
+import { copyTextToClipboard } from '@/lib/clipboard';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
 import { useFilesViewTabsStore } from '@/stores/useFilesViewTabsStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { getProjectActionsState } from '@/lib/openchamberConfig';
-import { readPackageJsonScripts, detectDevServerCommand } from '@/lib/detectDevServer';
+import { readPackageJsonScripts, findDevServerCandidates, type DevServerInfo } from '@/lib/detectDevServer';
 import { useTerminalStore } from '@/stores/useTerminalStore';
 import { connectTerminalStream, createTerminalSession, sendTerminalInput } from '@/lib/terminalApi';
+import { useSessionUIStore } from '@/sync/session-ui-store';
+import { useConfigStore } from '@/stores/useConfigStore';
+import { useMcpConfigStore } from '@/stores/useMcpConfigStore';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { toast } from '@/components/ui/toast';
 import { ContextPanelContent } from './ContextSidebarTab';
 
 const CONTEXT_PANEL_MIN_WIDTH = 360;
@@ -225,12 +239,29 @@ const truncateTabLabel = (value: string, maxChars: number): string => {
 
 type PreviewPaneProps = {
   rawUrl: string;
+  onNavigate: (nextUrl: string) => void;
+};
+
+const normalizePreviewNavigateUrl = (value: string): string | null => {
+  const raw = (value || '').trim();
+  if (!raw) return null;
+
+  const candidate = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 };
 
 type PreviewProxyState =
   | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'ready'; proxyBasePath: string; expiresAt: number }
+  | { status: 'ready'; proxyBasePath: string; previewOrigin: string | null; mode: 'subdomain' | 'path'; expiresAt: number }
   | { status: 'error'; message: string };
 
 // Module-scoped, in-memory cache of registered proxy targets keyed by the
@@ -240,7 +271,7 @@ type PreviewProxyState =
 // the proxy id, so a stale persisted entry would 404 after a server restart.
 // Entries are evicted on registration error (refetched) or when the upstream
 // returns 403 (cookie expired) / 404 (target unknown) at iframe load time.
-type CachedProxyTarget = { proxyBasePath: string; expiresAt: number };
+type CachedProxyTarget = { proxyBasePath: string; previewOrigin: string | null; mode: 'subdomain' | 'path'; expiresAt: number };
 const previewProxyTargetCache = new Map<string, CachedProxyTarget>();
 const PREVIEW_PROXY_CACHE_SAFETY_MS = 30_000;
 
@@ -254,10 +285,25 @@ const getCachedProxyTarget = (url: string): CachedProxyTarget | null => {
   return entry;
 };
 
-const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
+const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
   const { t } = useI18n();
+  const currentSessionId = useSessionUIStore((s) => s.currentSessionId);
+  const sendMessage = useSessionUIStore((s) => s.sendMessage);
+  const getLastUserChoice = useSessionUIStore((s) => s.getLastUserChoice);
+  const mcpServers = useMcpConfigStore((s) => s.mcpServers);
+  const setSettingsDialogOpen = useUIStore((s) => s.setSettingsDialogOpen);
+  const setSettingsPage = useUIStore((s) => s.setSettingsPage);
   const [reloadNonce, bumpReload] = React.useReducer((x: number) => x + 1, 0);
   const [proxyState, setProxyState] = React.useState<PreviewProxyState>({ status: 'idle' });
+
+  const [draftUrl, setDraftUrl] = React.useState(rawUrl);
+  const isEditingRef = React.useRef(false);
+
+  React.useEffect(() => {
+    if (!isEditingRef.current) {
+      setDraftUrl(rawUrl);
+    }
+  }, [rawUrl]);
 
   let parsedUrl: URL | null = null;
   try {
@@ -290,7 +336,13 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
 
     const cached = getCachedProxyTarget(targetKey);
     if (cached) {
-      setProxyState({ status: 'ready', proxyBasePath: cached.proxyBasePath, expiresAt: cached.expiresAt });
+      setProxyState({
+        status: 'ready',
+        proxyBasePath: cached.proxyBasePath,
+        previewOrigin: cached.previewOrigin,
+        mode: cached.mode,
+        expiresAt: cached.expiresAt,
+      });
       return;
     }
 
@@ -318,10 +370,17 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
           return;
         }
 
-        const body = await response.json() as { proxyBasePath?: unknown; expiresAt?: unknown };
+        const body = await response.json() as {
+          proxyBasePath?: unknown;
+          previewOrigin?: unknown;
+          mode?: unknown;
+          expiresAt?: unknown;
+        };
         const proxyBasePath = typeof body.proxyBasePath === 'string' ? body.proxyBasePath : '';
+        const previewOrigin = typeof body.previewOrigin === 'string' && body.previewOrigin ? body.previewOrigin : null;
+        const mode: 'subdomain' | 'path' = body.mode === 'subdomain' ? 'subdomain' : 'path';
         const expiresAt = typeof body.expiresAt === 'number' ? body.expiresAt : 0;
-        if (!proxyBasePath) {
+        if (!proxyBasePath || (mode === 'subdomain' && !previewOrigin)) {
           previewProxyTargetCache.delete(targetKey);
           if (!cancelled) {
             setProxyState({ status: 'error', message: t('contextPanel.preview.proxyError') });
@@ -329,9 +388,9 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
           return;
         }
 
-        previewProxyTargetCache.set(targetKey, { proxyBasePath, expiresAt });
+        previewProxyTargetCache.set(targetKey, { proxyBasePath, previewOrigin, mode, expiresAt });
         if (!cancelled) {
-          setProxyState({ status: 'ready', proxyBasePath, expiresAt });
+          setProxyState({ status: 'ready', proxyBasePath, previewOrigin, mode, expiresAt });
         }
       } catch (error) {
         previewProxyTargetCache.delete(targetKey);
@@ -357,6 +416,15 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
       const path = normalizedUrl.pathname || '/';
       const search = normalizedUrl.search || '';
       const hash = normalizedUrl.hash || '';
+      // Subdomain mode: build a fully-qualified URL so the iframe loads from
+      // <id>.preview.localhost (or <id>.<ip>.nip.io). Root-absolute URLs
+      // emitted by Vite (e.g. /@react-refresh, /main.tsx) then resolve to the
+      // same subdomain and proxy correctly.
+      if (proxyState.mode === 'subdomain' && proxyState.previewOrigin) {
+        return `${proxyState.previewOrigin}${path}${search}${hash}`;
+      }
+      // Path-prefix mode (legacy / tunnel fallback). Vite-style apps will not
+      // load correctly because root-absolute URLs bypass the prefix.
       return `${proxyState.proxyBasePath}${path}${search}${hash}`;
     })()
     : '';
@@ -392,13 +460,25 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
     setUpstreamState('unknown');
 
     void (async () => {
+      // Subdomain mode is cross-origin to the OpenChamber UI page, so the
+      // probe cannot read the response status without CORS. We switch to
+      // `no-cors` and treat any successful network round-trip as "reachable".
+      // We lose 502→"starting" UX in this mode, but that's acceptable: when
+      // the dev server is down the iframe will show the proxy's HTML error
+      // anyway, and `redirect: 'manual'` keeps redirects from masking failure.
+      // Detect subdomain mode from `proxySrc` itself: it's an absolute URL
+      // when subdomain mode is active, and a path-prefix when not.
+      const isSubdomainMode = /^https?:\/\//i.test(proxySrc);
       const probe = async (method: 'HEAD' | 'GET'): Promise<Response | null> => {
         try {
           return await fetch(proxySrc, {
             method,
-            credentials: 'include',
+            credentials: isSubdomainMode ? 'omit' : 'include',
+            mode: isSubdomainMode ? 'no-cors' : 'cors',
             cache: 'no-store',
-            redirect: 'manual',
+            // `redirect: 'manual'` is invalid in `no-cors` mode (the browser
+            // throws TypeError). Use 'follow' for subdomain mode.
+            redirect: isSubdomainMode ? 'follow' : 'manual',
           });
         } catch {
           return null;
@@ -407,6 +487,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
 
       let response = await probe('HEAD');
       // Some dev servers reject HEAD with 404/405; fall back to a single GET.
+      // (status is always 0 in no-cors mode, so this branch is a no-op there.)
       if (response && (response.status === 404 || response.status === 405)) {
         response = await probe('GET');
       }
@@ -459,12 +540,121 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
     && proxyState.status === 'ready'
     && upstreamState === 'unreachable';
 
+  const canSubmitDraft = Boolean(normalizePreviewNavigateUrl(draftUrl));
+
+  const handleSubmitUrl = React.useCallback(() => {
+    const normalized = normalizePreviewNavigateUrl(draftUrl);
+    if (!normalized) {
+      return;
+    }
+    isEditingRef.current = false;
+    onNavigate(normalized);
+  }, [draftUrl, onNavigate]);
+
   return (
     <div className="absolute inset-0 flex flex-col">
       <div className="flex items-center gap-1 border-b border-border/40 bg-[var(--surface-background)] px-2 py-1">
-        <div className="min-w-0 flex-1 truncate typography-micro text-muted-foreground" title={headerSrc || rawUrl}>
-          {headerSrc || rawUrl || t('contextPanel.preview.empty')}
-        </div>
+        <Input
+          value={draftUrl}
+          onChange={(event) => setDraftUrl(event.target.value)}
+          onFocus={() => {
+            isEditingRef.current = true;
+          }}
+          onBlur={() => {
+            isEditingRef.current = false;
+            setDraftUrl(rawUrl);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              handleSubmitUrl();
+            }
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              isEditingRef.current = false;
+              setDraftUrl(rawUrl);
+              (event.currentTarget as HTMLInputElement | null)?.blur();
+            }
+          }}
+          placeholder={t('contextPanel.preview.urlPlaceholder')}
+          title={headerSrc || rawUrl}
+          aria-label={t('contextPanel.preview.urlAria')}
+          className="h-7 min-w-0 flex-1 px-2 py-0 typography-micro"
+        />
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-7 w-7 p-0"
+          onClick={async () => {
+            const normalized = normalizePreviewNavigateUrl(draftUrl);
+            if (!normalized) return;
+            await copyTextToClipboard(normalized);
+          }}
+          title={t('contextPanel.preview.actions.copyUrl')}
+          aria-label={t('contextPanel.preview.actions.copyUrl')}
+          disabled={!canSubmitDraft}
+        >
+          <RiFileCopyLine className="h-3.5 w-3.5" />
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-7 w-7 p-0"
+          onClick={async () => {
+            const normalized = normalizePreviewNavigateUrl(draftUrl);
+            if (!normalized) return;
+
+            const hasMeteorDroid = mcpServers.some((server) => {
+              const cmd = (server as { command?: string[] }).command;
+              return Array.isArray(cmd) && cmd.some((part) => typeof part === 'string' && part.includes('meteordroid'));
+            });
+            if (!hasMeteorDroid) {
+              toast.message(t('contextPanel.preview.toast.meteordroidNotConfigured'));
+              setSettingsPage('mcp');
+              setSettingsDialogOpen(true);
+              return;
+            }
+
+            if (!currentSessionId) {
+              toast.error(t('contextPanel.preview.toast.noActiveSession'));
+              return;
+            }
+
+            const choice = getLastUserChoice(currentSessionId);
+            const config = useConfigStore.getState();
+            const providerID = choice?.providerID ?? config.currentProviderId;
+            const modelID = choice?.modelID ?? config.currentModelId;
+            const agent = choice?.agent ?? config.currentAgentName ?? undefined;
+            const variant = choice?.variant ?? config.currentVariant ?? undefined;
+
+            if (!providerID || !modelID) {
+              toast.error(t('contextPanel.preview.toast.missingModel'));
+              return;
+            }
+
+            // Keep the visible text short; put tool instructions in a synthetic part.
+            const visible = t('contextPanel.preview.agentMessage.visible', { url: normalized });
+            const instructions = t('contextPanel.preview.agentMessage.instructions', { url: normalized });
+            await sendMessage(
+              visible,
+              providerID,
+              modelID,
+              agent,
+              [],
+              undefined,
+              [{ text: instructions, synthetic: true }],
+              variant,
+            );
+            toast.success(t('contextPanel.preview.toast.sentToAgent'));
+          }}
+          title={t('contextPanel.preview.actions.openInAgentBrowser')}
+          aria-label={t('contextPanel.preview.actions.openInAgentBrowser')}
+          disabled={!canSubmitDraft}
+        >
+          <RiPlayLine className="h-3.5 w-3.5" />
+        </Button>
         <Button
           type="button"
           size="sm"
@@ -533,11 +723,16 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl }) => {
               <div className="text-center text-xs opacity-70">{proxyState.message}</div>
             ) : null}
           </div>
-        ) : (
-          <div className="flex h-full items-center justify-center px-6 text-sm text-muted-foreground">
-            {t('contextPanel.preview.invalidUrl')}
-          </div>
-        )}
+         ) : rawUrl.trim().length === 0 ? (
+           <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
+             <div>{t('contextPanel.preview.emptyState')}</div>
+             <div className="text-xs opacity-70">{t('contextPanel.preview.urlPlaceholder')}</div>
+           </div>
+         ) : (
+           <div className="flex h-full items-center justify-center px-6 text-sm text-muted-foreground">
+             {t('contextPanel.preview.invalidUrl')}
+           </div>
+         )}
       </div>
     </div>
   );
@@ -555,6 +750,7 @@ export const ContextPanel: React.FC = () => {
   const setContextPanelWidth = useUIStore((state) => state.setContextPanelWidth);
   const setActiveContextPanelTab = useUIStore((state) => state.setActiveContextPanelTab);
   const reorderContextPanelTabs = useUIStore((state) => state.reorderContextPanelTabs);
+  const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
   const setPendingDiffFile = useUIStore((state) => state.setPendingDiffFile);
   const setSelectedFilePath = useFilesViewTabsStore((state) => state.setSelectedPath);
   const openContextPreview = useUIStore((state) => state.openContextPreview);
@@ -572,6 +768,7 @@ export const ContextPanel: React.FC = () => {
   // Start Preview feature state
   const [isStartingPreview, setIsStartingPreview] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
+  const [previewCandidates, setPreviewCandidates] = React.useState<DevServerInfo[] | null>(null);
   const ensureDirectory = useTerminalStore((state) => state.ensureDirectory);
   const createTab = useTerminalStore((state) => state.createTab);
   const setTabLabel = useTerminalStore((state) => state.setTabLabel);
@@ -677,40 +874,35 @@ export const ContextPanel: React.FC = () => {
     closeContextPanel(directoryKey);
   }, [closeContextPanel, directoryKey]);
 
-  const handleStartPreview = React.useCallback(async () => {
+  const reportPreviewError = React.useCallback((message: string) => {
+    setPreviewError(message);
+    // Surface the error regardless of which context tab is currently active —
+    // the inline previewError UI only renders inside the preview tab branch.
+    toast.error(message);
+  }, []);
+
+  const runDevServerCandidate = React.useCallback(async (devServer: DevServerInfo) => {
     if (!effectiveDirectory || !directoryKey) return;
-    
+
+    const cwd = devServer.cwd || effectiveDirectory;
+
     setIsStartingPreview(true);
     setPreviewError(null);
-    
+
     try {
-      // Load project actions and package.json scripts
-      const [actionsState, scripts] = await Promise.all([
-        getProjectActionsState({ id: '', path: effectiveDirectory }),
-        readPackageJsonScripts(effectiveDirectory),
-      ]);
-      
-      // Detect the dev server command
-      const devServer = await detectDevServerCommand(effectiveDirectory, actionsState.actions, scripts);
-      
-      if (!devServer) {
-        setPreviewError(t('contextPanel.preview.noDevServer'));
-        setIsStartingPreview(false);
-        return;
-      }
-      
       // Ensure terminal directory exists
       ensureDirectory(effectiveDirectory);
-      
+
       // Create a new terminal tab for the dev server
       const tabId = createTab(effectiveDirectory);
       setTabLabel(effectiveDirectory, tabId, `Preview: ${devServer.label}`);
-      
-      // Start the terminal session with the dev command
+
+      // Start the terminal session with the dev command in the candidate's cwd
+      // (important for monorepos where the dev script lives in a subdir).
       const session = await createTerminalSession({
-        cwd: effectiveDirectory,
+        cwd,
       });
-      
+
       setTabSessionId(effectiveDirectory, tabId, session.sessionId);
       setTabLifecycle(effectiveDirectory, tabId, 'running');
 
@@ -780,7 +972,7 @@ export const ContextPanel: React.FC = () => {
         }
 
         if (tab?.lifecycle === 'exited') {
-          setPreviewError(formatExitError(tab, t));
+          reportPreviewError(formatExitError(tab, t));
           setConnecting(effectiveDirectory, tabId, false);
           disconnectStream();
           return true;
@@ -800,18 +992,64 @@ export const ContextPanel: React.FC = () => {
       const finalState = useTerminalStore.getState().getDirectoryState(effectiveDirectory);
       const finalTab = finalState?.tabs.find(t => t.id === tabId);
       if (!finalTab?.previewUrl && finalTab?.lifecycle !== 'exited') {
-        setPreviewError(formatNoUrlError(finalTab, t));
+        reportPreviewError(formatNoUrlError(finalTab, t));
       }
 
       setConnecting(effectiveDirectory, tabId, false);
       disconnectStream();
-      
+
     } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : t('contextPanel.preview.startFailed'));
+      reportPreviewError(error instanceof Error ? error.message : t('contextPanel.preview.startFailed'));
     } finally {
       setIsStartingPreview(false);
     }
-  }, [effectiveDirectory, directoryKey, ensureDirectory, createTab, setTabLabel, setTabSessionId, setTabLifecycle, setConnecting, openContextPreview, t]);
+  }, [effectiveDirectory, directoryKey, ensureDirectory, createTab, setTabLabel, setTabSessionId, setTabLifecycle, setConnecting, openContextPreview, reportPreviewError, t]);
+
+  const handleStartPreview = React.useCallback(async () => {
+    if (!effectiveDirectory || !directoryKey) return;
+
+    setIsStartingPreview(true);
+    setPreviewError(null);
+
+    let candidates: DevServerInfo[] = [];
+    try {
+      const [actionsState, scripts] = await Promise.all([
+        getProjectActionsState({ id: '', path: effectiveDirectory }),
+        readPackageJsonScripts(effectiveDirectory),
+      ]);
+      candidates = await findDevServerCandidates(effectiveDirectory, actionsState.actions, scripts);
+    } catch (error) {
+      reportPreviewError(error instanceof Error ? error.message : t('contextPanel.preview.startFailed'));
+      setIsStartingPreview(false);
+      return;
+    }
+
+    if (candidates.length === 0) {
+      reportPreviewError(t('contextPanel.preview.noDevServer'));
+      setIsStartingPreview(false);
+      return;
+    }
+
+    if (candidates.length === 1) {
+      await runDevServerCandidate(candidates[0]);
+      return;
+    }
+
+    // Multiple monorepo candidates — let the user pick. Keep
+    // `isStartingPreview` true while the picker is open so the button shows
+    // "Starting..." and remains disabled.
+    setPreviewCandidates(candidates);
+  }, [effectiveDirectory, directoryKey, runDevServerCandidate, reportPreviewError, t]);
+
+  const handlePickCandidate = React.useCallback(async (candidate: DevServerInfo) => {
+    setPreviewCandidates(null);
+    await runDevServerCandidate(candidate);
+  }, [runDevServerCandidate]);
+
+  const handleCancelPicker = React.useCallback(() => {
+    setPreviewCandidates(null);
+    setIsStartingPreview(false);
+  }, []);
 
   const handleToggleExpanded = React.useCallback(() => {
     if (!directoryKey) {
@@ -955,7 +1193,31 @@ export const ContextPanel: React.FC = () => {
         : activeTab?.mode === 'plan'
             ? <PlanView targetPath={activeTab.targetPath} />
             : activeTab?.mode === 'preview'
-                ? <PreviewPane rawUrl={activeTab.targetPath ?? ''} />
+                ? (
+                    <PreviewPane
+                      rawUrl={activeTab.targetPath ?? ''}
+                      onNavigate={(nextUrl) => {
+                        if (!directoryKey) return;
+
+                        // Keep navigation within the current preview tab by reusing its dedupeKey.
+                        const dedupeKey = activeTab.dedupeKey || nextUrl;
+                        let label: string | null = null;
+                        try {
+                          const parsed = new URL(nextUrl);
+                          label = parsed.host || parsed.hostname || null;
+                        } catch {
+                          // ignore
+                        }
+
+                        openContextPanelTab(directoryKey, {
+                          mode: 'preview',
+                          targetPath: nextUrl,
+                          dedupeKey,
+                          label,
+                        });
+                      }}
+                    />
+                  )
                 : showStartPreview
                     ? (
                         <div className="flex h-full flex-col items-center justify-center gap-4 p-6 text-center">
@@ -1178,6 +1440,42 @@ export const ContextPanel: React.FC = () => {
         })}
         {activeTab?.mode !== 'chat' && !isFileTabActive ? activeNonChatContent : null}
       </div>
+      <Dialog
+        open={previewCandidates !== null}
+        onOpenChange={(open) => {
+          if (!open) handleCancelPicker();
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('contextPanel.preview.picker.title')}</DialogTitle>
+            <DialogDescription>{t('contextPanel.preview.picker.description')}</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-1.5 py-2">
+            {(previewCandidates ?? []).map((candidate, index) => (
+              <Button
+                key={`${candidate.cwd ?? ''}::${candidate.command}::${index}`}
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => handlePickCandidate(candidate)}
+                className="justify-start gap-2 text-left"
+              >
+                <RiPlayLine className="h-3.5 w-3.5 shrink-0" />
+                <span className="flex flex-col items-start">
+                  <span className="typography-ui-default truncate">{candidate.label}</span>
+                  <span className="typography-micro text-muted-foreground truncate">{candidate.command}</span>
+                </span>
+              </Button>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="ghost" size="sm" onClick={handleCancelPicker}>
+              {t('contextPanel.preview.picker.cancel')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 };

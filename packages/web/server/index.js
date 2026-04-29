@@ -1051,6 +1051,18 @@ async function main(options = {}) {
   server = http.createServer(app);
 
   const uiPassword = typeof options.uiPassword === 'string' ? options.uiPassword : null;
+
+  // Preview proxy host-gate must run BEFORE the global JSON body parser
+  // installed by `setupBaseRoutes`; otherwise POST bodies destined for the
+  // proxied dev server (on the *.preview.localhost / *.nip.io subdomain) get
+  // consumed before they reach the proxy.
+  const previewProxyRuntime = createPreviewProxyRuntime({
+    crypto,
+    URL,
+    createProxyMiddleware,
+  });
+  previewProxyRuntime.attachHostGate(app);
+
   const bootstrapResult = bootstrapRuntime.setupBaseRoutes(app, {
     process,
     openchamberVersion: OPENCHAMBER_VERSION,
@@ -1157,11 +1169,6 @@ async function main(options = {}) {
     writeSseEvent,
   });
 
-  const previewProxyRuntime = createPreviewProxyRuntime({
-    crypto,
-    URL,
-    createProxyMiddleware,
-  });
   previewProxyRuntime.attach(app, {
     server,
     express,

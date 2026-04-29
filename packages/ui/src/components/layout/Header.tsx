@@ -16,7 +16,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { SortableTabsStrip, type SortableTabsStripItem } from '@/components/ui/sortable-tabs-strip';
 
-import { RiArrowLeftSLine, RiChat4Line, RiChatNewLine, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiLayoutRightLine, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiStackLine, RiTerminalBoxLine, RiTimerLine, RiAlertLine, type RemixiconComponentType } from '@remixicon/react';
+import { RiArrowLeftSLine, RiChat4Line, RiChatNewLine, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiGlobalLine, RiLayoutLeftLine, RiLayoutRightLine, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiStackLine, RiTerminalBoxLine, RiTimerLine, RiAlertLine, type RemixiconComponentType } from '@remixicon/react';
 import { DiffIcon } from '@/components/icons/DiffIcon';
 import { useUIStore, type MainTab } from '@/stores/useUIStore';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -76,6 +76,7 @@ const MOBILE_HEADER_ICON_BUTTON_CLASS = 'app-region-no-drag inline-flex h-9 w-9 
 
 type HeaderIconActionButtonProps = {
   visible?: boolean;
+  disabled?: boolean;
   title: string;
   ariaLabel: string;
   onClick: () => void;
@@ -86,6 +87,7 @@ type HeaderIconActionButtonProps = {
 
 const HeaderIconActionButton = React.memo(function HeaderIconActionButton({
   visible = true,
+  disabled = false,
   title,
   ariaLabel,
   onClick,
@@ -105,6 +107,7 @@ const HeaderIconActionButton = React.memo(function HeaderIconActionButton({
           onClick={onClick}
           aria-label={ariaLabel}
           className={className ?? DESKTOP_HEADER_ICON_BUTTON_CLASS}
+          disabled={disabled}
         >
           <Icon className={iconClassName ?? 'h-[18px] w-[18px]'} />
         </button>
@@ -662,6 +665,7 @@ export const Header: React.FC<HeaderProps> = ({
   const toggleRightSidebar = useUIStore((state) => state.toggleRightSidebar);
   const openContextOverview = useUIStore((state) => state.openContextOverview);
   const openContextPlan = useUIStore((state) => state.openContextPlan);
+  const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
   const closeContextPanel = useUIStore((state) => state.closeContextPanel);
   const contextPanelByDirectory = useUIStore((state) => state.contextPanelByDirectory);
   const activeMainTab = useUIStore((state) => state.activeMainTab);
@@ -1300,6 +1304,49 @@ export const Header: React.FC<HeaderProps> = ({
     return getActiveContextMode(panelState) === 'context';
   }, [contextPanelByDirectory, openDirectory]);
 
+  const currentPreviewUrl = React.useMemo(() => {
+    const directory = normalize(openDirectory || '');
+    if (!directory) {
+      return null;
+    }
+    const panelState = contextPanelByDirectory[directory];
+    const tabs = panelState?.tabs ?? [];
+    if (!Array.isArray(tabs) || tabs.length === 0) {
+      return null;
+    }
+
+    const activeTab = tabs.find((tab) => tab.id === panelState?.activeTabId) ?? tabs[tabs.length - 1];
+    if (activeTab?.mode === 'preview' && typeof (activeTab as { targetPath?: unknown }).targetPath === 'string') {
+      const url = (activeTab as { targetPath: string }).targetPath.trim();
+      return url.length > 0 ? url : null;
+    }
+
+    for (let i = tabs.length - 1; i >= 0; i -= 1) {
+      const tab = tabs[i];
+      if (tab?.mode !== 'preview') continue;
+      const url = typeof (tab as { targetPath?: unknown }).targetPath === 'string' ? (tab as { targetPath: string }).targetPath.trim() : '';
+      if (url) return url;
+    }
+
+    return null;
+  }, [contextPanelByDirectory, openDirectory]);
+
+  const handleOpenPreviewBrowser = React.useCallback(() => {
+    const directory = normalize(openDirectory || '');
+    if (!directory) {
+      return;
+    }
+
+    // If we have a URL, open/focus it in the in-app preview pane.
+    // If we don't, still open the preview pane so the user can type a URL.
+    openContextPanelTab(directory, {
+      mode: 'preview',
+      targetPath: currentPreviewUrl ?? '',
+      dedupeKey: 'preview',
+      label: null,
+    });
+  }, [currentPreviewUrl, openContextPanelTab, openDirectory]);
+
   const handleOpenContextPlan = React.useCallback(() => {
     const directory = normalize(openDirectory || '');
     if (!directory) {
@@ -1894,6 +1941,12 @@ export const Header: React.FC<HeaderProps> = ({
               percentIconClassName="h-5 w-5"
             />
           ) : null}
+          <HeaderIconActionButton
+            title={t('header.actions.openPreviewBrowser')}
+            ariaLabel={t('header.actions.openPreviewBrowserAria')}
+            onClick={handleOpenPreviewBrowser}
+            Icon={RiGlobalLine}
+          />
           {desktopSidebarActionsInline ? desktopSidebarActions : null}
           {!desktopSidebarActionsInline && desktopRightSidebarActionsHost
             ? createPortal(desktopSidebarActions, desktopRightSidebarActionsHost)
